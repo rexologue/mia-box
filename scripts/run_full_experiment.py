@@ -5,6 +5,12 @@ from typing import Any, Dict
 import sys
 
 import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_PATH = PROJECT_ROOT / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+
 from modelinversion.experiments.noise_utils import ensure_datasets_pt, load_datasets_from_pt
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
