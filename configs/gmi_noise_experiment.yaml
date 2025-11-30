@@ -1,0 +1,29 @@
+exp_root: "experiments/gmi_noise"
+datasets:
+  - mnist
+  - fmnist
+  - overhead_mnist
+noise_levels: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+use_public_only: true
+
+training:
+  batch_size: 64
+  num_epochs: 3
+  num_workers: 4
+  learning_rate: 0.001
+  seed: 42
+
+gmi:
+  enabled: true
+  batch_size: 8
+  num_workers: 2
+  samples_per_class: 5
+  iter_times: 150
+  mse_weight: 1.0
+  ce_weight: 1.0
+
+steps:
+  prepare_datasets: true
+  train_models: true
+  eval_classification: true
+  run_gmi: true
