@@ -463,7 +463,17 @@ def run_simple_gmi(
             targets = targets.repeat(1, 3, 1, 1)
         current_targets = targets
 
-        latents = sampler(list(labels.cpu().numpy()), len(labels)).to(device)
+        latents = sampler(list(labels.cpu().numpy()), len(labels))
+        if isinstance(latents, dict):
+            latents = torch.stack(
+                [
+                    latents[int(label)][0]
+                    if latents[int(label)].ndim > 1
+                    else latents[int(label)]
+                    for label in labels.tolist()
+                ]
+            )
+        latents = latents.to(device)
         output = optimization(latents, labels)
         reconstructions.append(output.images.cpu())
         gt_images.append(targets.cpu())
