@@ -14,11 +14,21 @@ import torch.nn.functional as F
 import torchvision
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 from torch.utils.data import DataLoader, TensorDataset
+from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
-from ..models.classifiers.base import construct_classifiers_by_name
+from ..attack import (
+    ComposeImageLoss,
+    GmiDiscriminatorLoss,
+    ImageAugmentClassificationLoss,
+    ImageClassifierAttackConfig,
+    ImageClassifierAttacker,
+)
 from ..attack.optimize import SimpleWhiteBoxOptimization, SimpleWhiteBoxOptimizationConfig
+from ..metrics import ImageFidPRDCMetric
+from ..models.classifiers.base import construct_classifiers_by_name
+from ..models.gans import auto_discriminator_from_pretrained, auto_generator_from_pretrained
 from ..sampler import SimpleLatentsSampler
 
 LOGGER = logging.getLogger(__name__)
@@ -41,6 +51,89 @@ DATASET_CONFIGS = {
         "in_channels": 1,
     },
 }
+
+
+class PTImageDataset(torch.utils.data.Dataset):
+    """Dataset helper for loading PT tensors saved by :func:`ensure_datasets_pt`.
+
+    The class mirrors the behavior of the ad-hoc dataset used in the prototype
+    script: images are converted to three channels, resized to a configurable
+    resolution through PIL, and an optional transform is applied afterwards.
+
+    Args:
+        pt_path (Path): Path to a ``.pt`` file containing ``{"images": ..., "labels": ...}``.
+        dataset_name (str): Name of the dataset (mnist / fmnist / cifar10) used for display.
+        preprocess_resolution (int): Target resolution before applying ``transform``.
+        transform (Callable, optional): Additional transform applied after resizing.
+    """
+
+    def __init__(
+        self,
+        pt_path: Path,
+        dataset_name: str,
+        preprocess_resolution: int = 64,
+        transform=None,
+    ) -> None:
+        super().__init__()
+
+        obj = torch.load(pt_path)
+        self.images = obj["images"]
+        self.labels = obj["labels"].long()
+
+        # Normalize shapes [N, C, H, W] / [N, H, W] -> [N, C, H, W]
+        if self.images.ndim == 3:
+            self.images = self.images.unsqueeze(1)
+
+        if self.images.dtype != torch.uint8:
+            # preserve information even when tensors are float in [0,1]
+            if self.images.max() <= 1:
+                self.images = (self.images * 255).round().to(torch.uint8)
+            else:
+                self.images = self.images.to(torch.uint8)
+
+        self.preprocess_resolution = preprocess_resolution
+        self.transform = transform
+
+        dataset_name = dataset_name.lower()
+        if dataset_name == "mnist":
+            self.name = "MNIST"
+        elif dataset_name in ("fmnist", "fashionmnist", "fashion-mnist"):
+            self.name = "FashionMNIST"
+        elif dataset_name == "cifar10":
+            self.name = "CIFAR10"
+        else:
+            raise ValueError(f"Unknown dataset_name: {dataset_name}")
+
+        self.targets = self.labels.tolist()
+
+        self._to_pil = transforms.ToPILImage()
+        self._resize = transforms.Resize(self.preprocess_resolution)
+
+    def __len__(self):
+        return self.images.shape[0]
+
+    def _preprocess_one(self, img_tensor: torch.Tensor):
+        if img_tensor.ndim != 3:
+            raise RuntimeError(f"Expected image tensor [C,H,W], got shape {img_tensor.shape}")
+
+        if img_tensor.shape[0] == 1:
+            img_tensor = img_tensor.repeat(3, 1, 1)
+        elif img_tensor.shape[0] != 3:
+            raise RuntimeError(f"Unsupported channel count: {img_tensor.shape[0]}")
+
+        pil_img = self._to_pil(img_tensor)
+        pil_img = self._resize(pil_img)
+        return pil_img
+
+    def __getitem__(self, idx: int):
+        img_tensor = self.images[idx]
+        label = self.labels[idx].item()
+
+        img = self._preprocess_one(img_tensor)
+        if self.transform is not None:
+            img = self.transform(img)
+
+        return img, label
 
 
 @dataclass
@@ -247,6 +340,14 @@ def preprocess_for_resnet(imgs: torch.Tensor, is_gray: bool) -> torch.Tensor:
     return imgs
 
 
+def _load_target_model_from_checkpoint(model_path: Path, num_classes: int) -> torch.nn.Module:
+    checkpoint = torch.load(model_path, map_location="cpu")
+    backbone = checkpoint.get("backbone", "resnet34")
+    model = construct_classifiers_by_name(backbone, num_classes=num_classes, resolution=32)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model
+
+
 def format_sigma(sigma: float) -> str:
     if sigma.is_integer():
         return str(int(sigma))
@@ -431,7 +532,32 @@ def run_simple_gmi(
     mse_weight: float = 1.0,
     ce_weight: float = 1.0,
     iter_times: int = 200,
+    generator_ckpt_path: Path | None = None,
+    discriminator_ckpt_path: Path | None = None,
+    preprocess_resolution: int = 64,
+    optimize_num: int = 50,
+    z_dim: int = 100,
+    inner_iter_times: int = 1500,
+    class_loss_weight: float = 100.0,
+    disc_loss_weight: float = 1.0,
 ):
+    if generator_ckpt_path is not None and discriminator_ckpt_path is not None:
+        return _run_gmi_with_pretrained_gan(
+            dataset,
+            model_path,
+            sigma,
+            batch_size,
+            num_workers,
+            preprocess_resolution=preprocess_resolution,
+            optimize_num=optimize_num,
+            z_dim=z_dim,
+            inner_iter_times=inner_iter_times,
+            class_loss_weight=class_loss_weight,
+            disc_loss_weight=disc_loss_weight,
+            generator_ckpt_path=generator_ckpt_path,
+            discriminator_ckpt_path=discriminator_ckpt_path,
+        )
+
     checkpoint = torch.load(model_path, map_location="cpu")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = construct_classifiers_by_name(
@@ -546,6 +672,159 @@ def run_simple_gmi(
         "psnr_mean": float(psnr.mean().item()),
         "ssim_mean": ssim_mean,
     }
+    (out_dir / "gmi_metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    return metrics
+
+
+def _run_gmi_with_pretrained_gan(
+    dataset: DatasetDescriptor,
+    model_path: Path,
+    sigma: float,
+    batch_size: int,
+    num_workers: int,
+    preprocess_resolution: int,
+    optimize_num: int,
+    z_dim: int,
+    inner_iter_times: int,
+    class_loss_weight: float,
+    disc_loss_weight: float,
+    generator_ckpt_path: Path,
+    discriminator_ckpt_path: Path,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_classes = int(dataset.train_labels.max().item()) + 1
+
+    target_model = _load_target_model_from_checkpoint(model_path, num_classes)
+    generator = auto_generator_from_pretrained(str(generator_ckpt_path))
+    discriminator = auto_discriminator_from_pretrained(str(discriminator_ckpt_path))
+
+    target_model = target_model.to(device)
+    generator = generator.to(device)
+    discriminator = discriminator.to(device)
+
+    target_model.eval()
+    generator.eval()
+    discriminator.eval()
+
+    latents_sampler = SimpleLatentsSampler(z_dim, batch_size)
+    optimization_config = SimpleWhiteBoxOptimizationConfig(
+        experiment_dir=str(model_path.parent / "gmi"),
+        device=device,
+        optimizer="SGD",
+        optimizer_kwargs={"lr": 0.02, "momentum": 0.9},
+        iter_times=inner_iter_times,
+        show_loss_info_iters=max(1, inner_iter_times // 5),
+    )
+
+    identity_loss_fn = ImageAugmentClassificationLoss(
+        classifier=target_model, loss_fn="ce", create_aug_images_fn=None
+    )
+    discriminator_loss_fn = GmiDiscriminatorLoss(discriminator)
+    loss_fn = ComposeImageLoss(
+        [identity_loss_fn, discriminator_loss_fn],
+        weights=[class_loss_weight, disc_loss_weight],
+    )
+
+    optimization = SimpleWhiteBoxOptimization(optimization_config, generator, loss_fn)
+
+    # Build evaluation dataset for FID/PRDC.
+    pt_dir = dataset.root_dir / "dataset"
+    pt_path = pt_dir / ("train_public.pt" if (pt_dir / "train_public.pt").exists() else "train.pt")
+    eval_dataset = PTImageDataset(
+        pt_path,
+        dataset.name,
+        preprocess_resolution,
+        transform=transforms.ToTensor(),
+    )
+
+    subset_images = []
+    subset_labels = []
+    for cls in dataset.test_labels.unique():
+        cls_indices = (dataset.test_labels == cls).nonzero(as_tuple=True)[0][:optimize_num]
+        subset_images.append(dataset.test_images[cls_indices])
+        subset_labels.append(dataset.test_labels[cls_indices])
+    subset_images = torch.cat(subset_images, dim=0)
+    subset_labels = torch.cat(subset_labels, dim=0)
+
+    loader = DataLoader(
+        TensorDataset(subset_images, subset_labels),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    reconstructions = []
+    gt_images = []
+    gt_labels = []
+
+    for imgs, labels in tqdm(loader, leave=False):
+        imgs = imgs.to(device)
+        labels = labels.to(device)
+        targets = F.interpolate(
+            imgs, size=(preprocess_resolution, preprocess_resolution), mode="bilinear", align_corners=False
+        )
+        if dataset.in_channels == 1:
+            targets = targets.repeat(1, 3, 1, 1)
+
+        latents = latents_sampler(list(labels.cpu().numpy()), len(labels)).to(device)
+        output = optimization(latents, labels)
+        reconstructions.append(output.images.cpu())
+        gt_images.append(targets.cpu())
+        gt_labels.append(labels.cpu())
+
+    reconstructions = torch.cat(reconstructions, dim=0)
+    gt_images = torch.cat(gt_images, dim=0)
+    gt_labels = torch.cat(gt_labels, dim=0)
+
+    mse = F.mse_loss(reconstructions, gt_images, reduction="none").view(len(reconstructions), -1).mean(dim=1)
+    mse_mean = mse.mean().item()
+    psnr = 10 * torch.log10(1.0 / torch.clamp(mse, min=1e-8))
+
+    try:
+        from piq import ssim
+    except Exception:
+        def ssim(x, y):
+            mu_x = x.mean(dim=(-2, -1))
+            mu_y = y.mean(dim=(-2, -1))
+            sigma_x = x.var(dim=(-2, -1))
+            sigma_y = y.var(dim=(-2, -1))
+            sigma_xy = ((x - mu_x[..., None, None]) * (y - mu_y[..., None, None])).var(dim=(-2, -1))
+            c1 = 0.01 ** 2
+            c2 = 0.03 ** 2
+            ssim_map = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
+                (mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2)
+            )
+            return ssim_map.mean(dim=1)
+    ssim_scores = ssim(reconstructions, gt_images)
+    if isinstance(ssim_scores, torch.Tensor):
+        ssim_scores = ssim_scores.cpu()
+    ssim_mean = float(torch.tensor(ssim_scores).mean().item())
+
+    # FID/PRDC on reconstructed images
+    fid_prdc_metric = ImageFidPRDCMetric(
+        batch_size,
+        eval_dataset,
+        device=device,
+        save_individual_prdc_dir=str(model_path.parent / "gmi"),
+        fid=True,
+        prdc=True,
+    )
+    features = fid_prdc_metric.get_features(reconstructions, gt_labels)
+    fid_results = fid_prdc_metric(features, gt_labels)
+
+    out_dir = model_path.parent / "gmi"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_image(make_grid(reconstructions, nrow=batch_size, normalize=True), out_dir / "reconstructions.png")
+
+    metrics = {
+        "dataset": dataset.name,
+        "sigma": sigma,
+        "mse_mean": mse_mean,
+        "psnr_mean": float(psnr.mean().item()),
+        "ssim_mean": ssim_mean,
+    }
+    metrics.update({k.lower(): float(v) for k, v in fid_results.items()})
     (out_dir / "gmi_metrics.json").write_text(json.dumps(metrics, indent=2))
 
     return metrics
