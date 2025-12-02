@@ -35,6 +35,24 @@ def parse_args():
         nargs="+",
         default=[x / 10 for x in range(0, 11)],
     )
+    parser.add_argument("--generator_template", type=str, default=None, help="Format string for generator checkpoint (use {dataset}).")
+    parser.add_argument(
+        "--discriminator_template",
+        type=str,
+        default=None,
+        help="Format string for discriminator checkpoint (use {dataset}).",
+    )
+    parser.add_argument(
+        "--gan_root",
+        type=Path,
+        default=None,
+        help="Root directory containing <dataset>_gan/G.pth and D.pth when templates are not provided.",
+    )
+    parser.add_argument("--preprocess_resolution", type=int, default=64)
+    parser.add_argument("--optimize_num", type=int, default=50)
+    parser.add_argument("--inner_iter_times", type=int, default=1500)
+    parser.add_argument("--class_loss_weight", type=float, default=100.0)
+    parser.add_argument("--disc_loss_weight", type=float, default=1.0)
     parser.add_argument("--use_public_only", action="store_true")
     parser.add_argument(
         "--datasets",
@@ -43,6 +61,14 @@ def parse_args():
         default=["mnist", "fmnist", "overhead_mnist"],
     )
     return parser.parse_args()
+
+
+def _resolve_gan_path(dataset_name: str, template: str | None, gan_root: Path | None, filename: str) -> Path | None:
+    if template:
+        return Path(template.format(dataset=dataset_name))
+    if gan_root:
+        return gan_root / f"{dataset_name}_gan" / filename
+    return None
 
 
 def plot_metric_curve(dataset_name: str, metric_name: str, records: dict, root: Path):
@@ -74,6 +100,12 @@ def main():
             if not model_path.exists():
                 LOGGER.warning("Missing checkpoint for sigma %s", sigma_str)
                 continue
+            generator_ckpt = _resolve_gan_path(
+                dataset.name, args.generator_template, args.gan_root, "G.pth"
+            )
+            discriminator_ckpt = _resolve_gan_path(
+                dataset.name, args.discriminator_template, args.gan_root, "D.pth"
+            )
             metrics = run_simple_gmi(
                 dataset,
                 model_path,
@@ -84,6 +116,14 @@ def main():
                 mse_weight=args.mse_weight,
                 ce_weight=args.ce_weight,
                 iter_times=args.iter_times,
+                generator_ckpt_path=generator_ckpt,
+                discriminator_ckpt_path=discriminator_ckpt,
+                preprocess_resolution=args.preprocess_resolution,
+                optimize_num=args.optimize_num,
+                z_dim=100,
+                inner_iter_times=args.inner_iter_times,
+                class_loss_weight=args.class_loss_weight,
+                disc_loss_weight=args.disc_loss_weight,
             )
             dataset_records[sigma] = metrics
         if dataset_records:
