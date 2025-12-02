@@ -3,6 +3,7 @@ apex==0.9.10dev
 dlib==19.24.4
 facenet_pytorch==2.5.2
 ignite==1.1.0
+kagglehub==0.3.13
 kornia==0.7.2
 lmdb==1.4.1
 matplotlib==3.8.2

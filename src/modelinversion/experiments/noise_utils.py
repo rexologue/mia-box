@@ -1,10 +1,13 @@
 import json
 import logging
+import shutil
+import struct
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import kagglehub
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
@@ -33,14 +36,9 @@ DATASET_CONFIGS = {
         "in_channels": 1,
     },
     "overhead_mnist": {
-        "factory": None,  # Placeholder, will fallback to CIFAR10
-        "kwargs": {"download": True},
-        "in_channels": 3,
-    },
-    "cifar10": {
-        "factory": torchvision.datasets.CIFAR10,
-        "kwargs": {"download": True},
-        "in_channels": 3,
+        "factory": None,
+        "kwargs": {},
+        "in_channels": 1,
     },
 }
 
@@ -58,22 +56,62 @@ class DatasetDescriptor:
 
 # --------------------- Dataset helpers ---------------------
 
+
+def _copy_if_missing(src: Path, dst: Path):
+    if dst.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+
+
+def _download_overhead_mnist(root: Path):
+    LOGGER.info("Downloading Overhead MNIST from Kaggle via kagglehub.")
+    cache_dir = Path(kagglehub.dataset_download("datamunge/overheadmnist"))
+    for filename in [
+        "train-images-idx3-ubyte",
+        "train-labels-idx1-ubyte",
+        "test-images-idx3-ubyte",
+        "test-labels-idx1-ubyte",
+    ]:
+        _copy_if_missing(cache_dir / filename, root / filename)
+
+
+def _read_idx_images(path: Path) -> torch.Tensor:
+    with path.open("rb") as f:
+        _, num, rows, cols = struct.unpack(">IIII", f.read(16))
+        data = torch.tensor(bytearray(f.read()), dtype=torch.uint8)
+    images = data.view(num, 1, rows, cols).float() / 255.0
+    return images
+
+
+def _read_idx_labels(path: Path) -> torch.Tensor:
+    with path.open("rb") as f:
+        _, num = struct.unpack(">II", f.read(8))
+        data = torch.tensor(bytearray(f.read()), dtype=torch.long)
+    return data.view(num)
+
+
+def _load_overhead_mnist(root: Path):
+    _download_overhead_mnist(root)
+    train_imgs = _read_idx_images(root / "train-images-idx3-ubyte")
+    train_labels = _read_idx_labels(root / "train-labels-idx1-ubyte")
+    test_imgs = _read_idx_images(root / "test-images-idx3-ubyte")
+    test_labels = _read_idx_labels(root / "test-labels-idx1-ubyte")
+    return train_imgs, train_labels, test_imgs, test_labels, DATASET_CONFIGS["overhead_mnist"]["in_channels"]
+
+
 def _load_raw_dataset(name: str, root: Path):
     name = name.lower()
     if name not in DATASET_CONFIGS:
         raise ValueError(f"Unsupported dataset {name}")
 
+    if name == "overhead_mnist":
+        return _load_overhead_mnist(root)
+
     cfg = DATASET_CONFIGS[name]
     factory = cfg["factory"]
     kwargs = cfg["kwargs"].copy()
     kwargs["root"] = str(root)
-
-    if name == "overhead_mnist":
-        # Fallback to CIFAR10 when overhead-MNIST is unavailable
-        factory = DATASET_CONFIGS["cifar10"]["factory"]
-        kwargs = DATASET_CONFIGS["cifar10"]["kwargs"].copy()
-        kwargs["root"] = str(root)
-        LOGGER.warning("overhead_mnist not provided; using CIFAR10 as fallback.")
 
     transform = torchvision.transforms.ToTensor()
     train_set = factory(train=True, transform=transform, **kwargs)

@@ -1,6 +1,6 @@
 # Noise-Robustness Experiments for ResNet-34 and GMI
 
-This repository now includes a complete, reproducible pipeline to study how input noise affects classification accuracy and Generative Model Inversion (GMI) quality on MNIST, FashionMNIST, and Overhead-MNIST (CIFAR-10 fallback).
+This repository now includes a complete, reproducible pipeline to study how input noise affects classification accuracy and Generative Model Inversion (GMI) quality on MNIST, FashionMNIST, and Overhead-MNIST (downloaded from Kaggle).
 
 ## Environment
 
