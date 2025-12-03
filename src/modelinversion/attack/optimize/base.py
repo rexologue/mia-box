@@ -3,7 +3,7 @@ import importlib
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Tuple, Callable, Optional, Iterable
+from typing import Tuple, Callable, Optional, Iterable, Dict
 
 import torch
 import torch.nn as nn
@@ -50,6 +50,7 @@ class ImageOptimizationOutput(BaseOutput):
     images: Tensor
     labels: LongTensor
     latents: Optional[Tensor] = None
+    intermediate_images: Optional[Dict[int, Tensor]] = None
 
 
 class BaseImageOptimization(ABC):
@@ -97,6 +98,7 @@ class SimpleWhiteBoxOptimizationConfig(BaseImageOptimizationConfig):
     optimizer_kwargs: dict = field(default_factory=lambda: {})
     iter_times: int = 600
     show_loss_info_iters: int = 100
+    save_image_iters: Optional[Iterable[int]] = None
 
     latent_constraint: Optional[BaseConstraint] = None
 
@@ -151,6 +153,9 @@ class SimpleWhiteBoxOptimization(BaseImageOptimization):
             [latents], **config.optimizer_kwargs
         )
 
+        save_iters: set[int] = set(config.save_image_iters or [])
+        snapshots: Dict[int, Tensor] = {}
+
         if config.latent_constraint is not None:
             config.latent_constraint.register_center(latents)
 
@@ -158,6 +163,9 @@ class SimpleWhiteBoxOptimization(BaseImageOptimization):
         for i in bar:
 
             fake = self.generator(latents, labels=labels)
+
+            if i in save_iters:
+                snapshots[i] = fake.detach().cpu()
 
             description = None
 
@@ -198,6 +206,7 @@ class SimpleWhiteBoxOptimization(BaseImageOptimization):
             images=final_fake,
             labels=final_labels,
             latents=latents.detach().cpu(),
+            intermediate_images=snapshots if snapshots else None,
         )
 
 

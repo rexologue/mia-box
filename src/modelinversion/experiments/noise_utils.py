@@ -2,7 +2,7 @@ import json
 import logging
 import shutil
 import struct
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from itertools import cycle
 from pathlib import Path
@@ -778,6 +778,7 @@ def run_simple_gmi(
     mse_weight: float = 1.0,
     ce_weight: float = 1.0,
     iter_times: int = 200,
+    save_image_iters: Optional[list[int]] = None,
     generator_ckpt_path: Path | None = None,
     discriminator_ckpt_path: Path | None = None,
     preprocess_resolution: int = 64,
@@ -800,6 +801,7 @@ def run_simple_gmi(
             inner_iter_times=inner_iter_times,
             class_loss_weight=class_loss_weight,
             disc_loss_weight=disc_loss_weight,
+            save_image_iters=save_image_iters,
             generator_ckpt_path=generator_ckpt_path,
             discriminator_ckpt_path=discriminator_ckpt_path,
         )
@@ -836,11 +838,13 @@ def run_simple_gmi(
         optimizer_kwargs={"lr": 0.05},
         iter_times=iter_times,
         show_loss_info_iters=max(1, iter_times // 5),
+        save_image_iters=save_image_iters,
     )
 
     reconstructions = []
     gt_images = []
     gt_labels = []
+    intermediate_images: dict[int, list[torch.Tensor]] = defaultdict(list)
 
     current_targets: Optional[torch.Tensor] = None
 
@@ -881,6 +885,9 @@ def run_simple_gmi(
         reconstructions.append(output.images.cpu())
         gt_images.append(targets.cpu())
         gt_labels.append(labels.cpu())
+        if output.intermediate_images:
+            for iter_idx, images in output.intermediate_images.items():
+                intermediate_images[iter_idx].append(images.cpu())
 
     reconstructions = torch.cat(reconstructions, dim=0)
     gt_images = torch.cat(gt_images, dim=0)
@@ -914,6 +921,13 @@ def run_simple_gmi(
     out_dir.mkdir(parents=True, exist_ok=True)
     save_image(make_grid(reconstructions, nrow=batch_size, normalize=True), out_dir / "reconstructions.png")
 
+    for iter_idx, image_batches in sorted(intermediate_images.items()):
+        iter_images = torch.cat(image_batches, dim=0)
+        save_image(
+            make_grid(iter_images, nrow=batch_size, normalize=True),
+            out_dir / f"reconstructions_iter_{iter_idx}.png",
+        )
+
     metrics = {
         "dataset": dataset.name,
         "sigma": sigma,
@@ -938,6 +952,7 @@ def _run_gmi_with_pretrained_gan(
     inner_iter_times: int,
     class_loss_weight: float,
     disc_loss_weight: float,
+    save_image_iters: Optional[list[int]] = None,
     generator_ckpt_path: Path,
     discriminator_ckpt_path: Path,
 ):
@@ -964,6 +979,7 @@ def _run_gmi_with_pretrained_gan(
         optimizer_kwargs={"lr": 0.02, "momentum": 0.9},
         iter_times=inner_iter_times,
         show_loss_info_iters=max(1, inner_iter_times // 5),
+        save_image_iters=save_image_iters,
     )
 
     identity_loss_fn = ImageAugmentClassificationLoss(
@@ -1006,6 +1022,7 @@ def _run_gmi_with_pretrained_gan(
     reconstructions = []
     gt_images = []
     gt_labels = []
+    intermediate_images: dict[int, list[torch.Tensor]] = defaultdict(list)
 
     for imgs, labels in tqdm(loader, leave=False):
         imgs = imgs.to(device)
@@ -1024,6 +1041,9 @@ def _run_gmi_with_pretrained_gan(
         reconstructions.append(output.images.cpu())
         gt_images.append(targets.cpu())
         gt_labels.append(labels.cpu())
+        if output.intermediate_images:
+            for iter_idx, images in output.intermediate_images.items():
+                intermediate_images[iter_idx].append(images.cpu())
 
     reconstructions = torch.cat(reconstructions, dim=0)
     gt_images = torch.cat(gt_images, dim=0)
@@ -1068,6 +1088,13 @@ def _run_gmi_with_pretrained_gan(
     out_dir = model_path.parent / "gmi"
     out_dir.mkdir(parents=True, exist_ok=True)
     save_image(make_grid(reconstructions, nrow=batch_size, normalize=True), out_dir / "reconstructions.png")
+
+    for iter_idx, image_batches in sorted(intermediate_images.items()):
+        iter_images = torch.cat(image_batches, dim=0)
+        save_image(
+            make_grid(iter_images, nrow=batch_size, normalize=True),
+            out_dir / f"reconstructions_iter_{iter_idx}.png",
+        )
 
     metrics = {
         "dataset": dataset.name,
