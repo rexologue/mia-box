@@ -605,7 +605,41 @@ class TrainingResult:
     model_path: Path
     metrics_path: Path
     history: Dict[str, List[float]]
-    test_acc: float
+    best_acc: float
+    best_epoch: int
+    best_loss: float
+
+
+def _evaluate_classifier(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    is_gray: bool,
+    criterion: torch.nn.Module,
+):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    preds = []
+    labels = []
+    with torch.no_grad():
+        for imgs, lbls in tqdm(loader, leave=False):
+            imgs = preprocess_for_resnet(imgs.float().to(device), is_gray)
+            lbls = lbls.to(device)
+            logits, _ = model(imgs)
+            loss = criterion(logits, lbls)
+
+            total_loss += loss.item() * len(imgs)
+            batch_preds = logits.argmax(dim=1)
+            correct += (batch_preds == lbls).sum().item()
+            total += len(imgs)
+            preds.append(batch_preds.cpu())
+            labels.append(lbls.cpu())
+
+    avg_loss = total_loss / total if total else 0.0
+    acc = correct / total if total else 0.0
+    return avg_loss, acc, torch.cat(preds), torch.cat(labels)
 
 
 def train_resnet_for_dataset(
@@ -633,8 +667,15 @@ def train_resnet_for_dataset(
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = torch.nn.CrossEntropyLoss()
 
-    history = {"loss": [], "acc": []}
-    for _ in range(epochs):
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    best_acc = float("-inf")
+    best_loss = float("inf")
+    best_epoch = -1
+    best_state = None
+    best_preds = None
+    best_labels = None
+
+    for epoch_idx in range(epochs):
         model.train()
         running_loss = 0.0
         correct = 0
@@ -655,36 +696,42 @@ def train_resnet_for_dataset(
             preds = logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += len(imgs)
-        history["loss"].append(running_loss / total)
-        history["acc"].append(correct / total)
+        train_loss = running_loss / total if total else 0.0
+        train_acc = correct / total if total else 0.0
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
 
-    # evaluation
-    model.eval()
-    all_preds = []
-    all_labels = []
-    with torch.no_grad():
-        correct = 0
-        total = 0
-        for imgs, labels in tqdm(test_loader, leave=False):
-            imgs = imgs.float().to(device)
-            labels = labels.to(device)
-            imgs = preprocess_for_resnet(imgs, dataset.in_channels == 1)
-            logits, _ = model(imgs)
-            preds = logits.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += len(imgs)
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
-    test_acc = correct / total
-    all_preds = torch.cat(all_preds)
-    all_labels = torch.cat(all_labels)
+        val_loss, val_acc, val_preds, val_labels = _evaluate_classifier(
+            model, test_loader, device, dataset.in_channels == 1, criterion
+        )
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+
+        if val_acc > best_acc or (val_acc == best_acc and val_loss < best_loss):
+            best_acc = val_acc
+            best_loss = val_loss
+            best_epoch = epoch_idx
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_preds = val_preds
+            best_labels = val_labels
+
+    if best_state is None:
+        best_epoch = len(history["val_acc"]) - 1 if history["val_acc"] else 0
+        best_acc = history["val_acc"][best_epoch] if history["val_acc"] else 0.0
+        best_loss = history["val_loss"][best_epoch] if history["val_loss"] else float("inf")
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model.load_state_dict(best_state)
 
     sigma_str = format_sigma(sigma)
     out_dir = dataset.root_dir / f"noise_{sigma_str}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # confusion matrix plot
-    cm = confusion_matrix(all_labels.numpy(), all_preds.numpy())
+    if best_preds is None or best_labels is None:
+        _, _, best_preds, best_labels = _evaluate_classifier(
+            model, test_loader, device, dataset.in_channels == 1, criterion
+        )
+    cm = confusion_matrix(best_labels.numpy(), best_preds.numpy())
     disp = ConfusionMatrixDisplay(cm)
     disp.plot(cmap="Blues")
     plt.title(f"{dataset.name} sigma={sigma}")
@@ -693,10 +740,12 @@ def train_resnet_for_dataset(
 
     # train curves
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-    ax[0].plot(history["loss"], label="train loss")
+    ax[0].plot(history["train_loss"], label="train loss")
+    ax[0].plot(history["val_loss"], label="val loss")
     ax[0].set_xlabel("epoch")
     ax[0].legend()
-    ax[1].plot(history["acc"], label="train acc")
+    ax[1].plot(history["train_acc"], label="train acc")
+    ax[1].plot(history["val_acc"], label="val acc")
     ax[1].set_xlabel("epoch")
     ax[1].legend()
     plt.suptitle(f"{dataset.name} sigma={sigma}")
@@ -707,27 +756,40 @@ def train_resnet_for_dataset(
     model_path = out_dir / "model.pt"
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": best_state,
             "backbone": "resnet34",
             "input_shape": "3x32x32",
             "sigma": sigma,
             "dataset": dataset.name,
             "num_classes": int(dataset.train_labels.max().item()) + 1,
+            "best_epoch": int(best_epoch),
+            "best_val_acc": float(best_acc),
+            "best_val_loss": float(best_loss),
         },
         model_path,
     )
     metrics = {
         "dataset": dataset.name,
         "sigma": sigma,
-        "min_train_loss": float(min(history["loss"])),
-        "train_acc_last_epoch": float(history["acc"][-1]),
-        "train_acc_best": float(max(history["acc"])),
-        "test_acc": float(test_acc),
+        "best_epoch": int(best_epoch) + 1,
+        "train_loss_best_epoch": float(history["train_loss"][best_epoch]),
+        "train_acc_best_epoch": float(history["train_acc"][best_epoch]),
+        "val_loss_best_epoch": float(best_loss),
+        "val_acc_best_epoch": float(best_acc),
+        "train_loss_min": float(min(history["train_loss"])) if history["train_loss"] else None,
+        "train_acc_last_epoch": float(history["train_acc"][-1]) if history["train_acc"] else None,
     }
     metrics_path = out_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
 
-    return TrainingResult(model_path=model_path, metrics_path=metrics_path, history=history, test_acc=test_acc)
+    return TrainingResult(
+        model_path=model_path,
+        metrics_path=metrics_path,
+        history=history,
+        best_acc=best_acc,
+        best_epoch=best_epoch,
+        best_loss=best_loss,
+    )
 
 
 # --------------------- Evaluation helpers ---------------------
@@ -952,9 +1014,9 @@ def _run_gmi_with_pretrained_gan(
     inner_iter_times: int,
     class_loss_weight: float,
     disc_loss_weight: float,
-    save_image_iters: Optional[list[int]] = None,
     generator_ckpt_path: Path,
     discriminator_ckpt_path: Path,
+    save_image_iters: Optional[list[int]] = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = int(dataset.train_labels.max().item()) + 1
