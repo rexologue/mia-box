@@ -1016,7 +1016,10 @@ def _run_gmi_with_pretrained_gan(
         if dataset.in_channels == 1:
             targets = targets.repeat(1, 3, 1, 1)
 
-        latents = latents_sampler(list(labels.cpu().numpy()), len(labels)).to(device)
+        latents_sample = latents_sampler(list(labels.cpu().numpy()), len(labels))
+        if isinstance(latents_sample, dict):
+            latents_sample = next(iter(latents_sample.values()))
+        latents = latents_sample.to(device)
         output = optimization(latents, labels)
         reconstructions.append(output.images.cpu())
         gt_images.append(targets.cpu())
