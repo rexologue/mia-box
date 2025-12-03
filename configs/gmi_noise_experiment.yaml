@@ -21,6 +21,9 @@ gmi:
   iter_times: 150
   mse_weight: 1.0
   ce_weight: 1.0
+  gan_ckpt_dir: "experiments/gmi_noise/gan_checkpoints"
+  generator_url: "https://drive.google.com/file/d/1is0tNjxL4QUAqjrhj7x0AjAh4fLIt-D0/view?usp=drive_link"
+  discriminator_url: "https://drive.google.com/file/d/1f9IzPbp8qucx55xN879b-kbDpZtzPpxC/view?usp=drive_link"
 
 steps:
   prepare_datasets: true

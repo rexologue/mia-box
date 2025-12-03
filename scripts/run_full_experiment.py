@@ -11,7 +11,12 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from modelinversion.experiments.noise_utils import ensure_datasets_pt, load_datasets_from_pt
+from modelinversion.experiments.noise_utils import (
+    DEFAULT_GAN_DISCRIMINATOR_URL,
+    DEFAULT_GAN_GENERATOR_URL,
+    ensure_datasets_pt,
+    load_datasets_from_pt,
+)
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 LOGGER = logging.getLogger(__name__)
@@ -100,6 +105,7 @@ def main():
 
     if steps.get("run_gmi", False) and cfg.get("gmi", {}).get("enabled", True):
         gmi_cfg = cfg.get("gmi", {})
+        gan_ckpt_dir = Path(gmi_cfg.get("gan_ckpt_dir", exp_root / "gan_checkpoints"))
         gmi_args = [
             "--exp_root", str(exp_root),
             "--batch_size", str(gmi_cfg.get("batch_size", 16)),
@@ -108,6 +114,9 @@ def main():
             "--iter_times", str(gmi_cfg.get("iter_times", 200)),
             "--mse_weight", str(gmi_cfg.get("mse_weight", 1.0)),
             "--ce_weight", str(gmi_cfg.get("ce_weight", 1.0)),
+            "--gan_ckpt_dir", str(gan_ckpt_dir),
+            "--generator_url", gmi_cfg.get("generator_url", DEFAULT_GAN_GENERATOR_URL),
+            "--discriminator_url", gmi_cfg.get("discriminator_url", DEFAULT_GAN_DISCRIMINATOR_URL),
             "--datasets", *dataset_names,
         ]
         if cfg.get("use_public_only", True):

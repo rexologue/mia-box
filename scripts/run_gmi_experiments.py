@@ -11,6 +11,10 @@ if str(SRC_PATH) not in sys.path:
 
 import matplotlib.pyplot as plt
 from modelinversion.experiments.noise_utils import (
+    DEFAULT_GAN_DISCRIMINATOR_URL,
+    DEFAULT_GAN_GENERATOR_URL,
+    copy_gan_checkpoints_for_attack,
+    ensure_gan_checkpoints,
     format_sigma,
     load_datasets_from_pt,
     run_simple_gmi,
@@ -47,6 +51,24 @@ def parse_args():
         type=Path,
         default=None,
         help="Root directory containing <dataset>_gan/G.pth and D.pth when templates are not provided.",
+    )
+    parser.add_argument(
+        "--gan_ckpt_dir",
+        type=Path,
+        default=None,
+        help="Directory to store shared GAN checkpoints downloaded from Google Drive.",
+    )
+    parser.add_argument(
+        "--generator_url",
+        type=str,
+        default=DEFAULT_GAN_GENERATOR_URL,
+        help="Google Drive URL for the base generator checkpoint.",
+    )
+    parser.add_argument(
+        "--discriminator_url",
+        type=str,
+        default=DEFAULT_GAN_DISCRIMINATOR_URL,
+        help="Google Drive URL for the base discriminator checkpoint.",
     )
     parser.add_argument("--preprocess_resolution", type=int, default=64)
     parser.add_argument("--optimize_num", type=int, default=50)
@@ -86,6 +108,19 @@ def plot_metric_curve(dataset_name: str, metric_name: str, records: dict, root: 
 
 def main():
     args = parse_args()
+    gan_ckpt_dir = args.gan_ckpt_dir or (args.exp_root / "gan_checkpoints")
+    base_generator_ckpt, base_discriminator_ckpt = ensure_gan_checkpoints(
+        gan_ckpt_dir,
+        generator_url=args.generator_url,
+        discriminator_url=args.discriminator_url,
+    )
+
+    def _choose_path(candidate: Path | None, fallback: Path) -> Path:
+        if candidate and candidate.exists():
+            return candidate
+        if candidate:
+            LOGGER.warning("Checkpoint %s not found; falling back to shared GAN checkpoint", candidate)
+        return fallback
     datasets = load_datasets_from_pt(
         args.exp_root, use_public=args.use_public_only, dataset_names=args.datasets
     )
@@ -105,6 +140,11 @@ def main():
             )
             discriminator_ckpt = _resolve_gan_path(
                 dataset.name, args.discriminator_template, args.gan_root, "D.pth"
+            )
+            generator_ckpt = _choose_path(generator_ckpt, base_generator_ckpt)
+            discriminator_ckpt = _choose_path(discriminator_ckpt, base_discriminator_ckpt)
+            generator_ckpt, discriminator_ckpt = copy_gan_checkpoints_for_attack(
+                model_path.parent, generator_ckpt, discriminator_ckpt
             )
             metrics = run_simple_gmi(
                 dataset,
