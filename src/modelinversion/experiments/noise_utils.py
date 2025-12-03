@@ -170,6 +170,8 @@ class PTImageDataset(torch.utils.data.Dataset):
             self.name = "MNIST"
         elif dataset_name in ("fmnist", "fashionmnist", "fashion-mnist"):
             self.name = "FashionMNIST"
+        elif dataset_name == "overhead_mnist":
+            self.name = "OverheadMNIST"
         elif dataset_name == "cifar10":
             self.name = "CIFAR10"
         else:
