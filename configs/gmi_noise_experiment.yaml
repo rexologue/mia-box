@@ -13,6 +13,25 @@ training:
   learning_rate: 0.001
   seed: 42
 
+gan:
+  enabled: true
+  use_pretrained: false
+  base_dir_template: null
+  train:
+    batch_size: 64
+    num_workers: 4
+    preprocess_resolution: 64
+    max_iters: 5000
+    z_dim: 100
+    lr: 0.0002
+    betas: [0.5, 0.999]
+    save_ckpt_iters: 500
+    show_images_iters: 500
+    show_train_info_iters: 100
+  pretrained:
+    generator_url: "https://drive.google.com/file/d/1is0tNjxL4QUAqjrhj7x0AjAh4fLIt-D0/view?usp=drive_link"
+    discriminator_url: "https://drive.google.com/file/d/1f9IzPbp8qucx55xN879b-kbDpZtzPpxC/view?usp=drive_link"
+
 gmi:
   enabled: true
   batch_size: 8
@@ -21,12 +40,10 @@ gmi:
   iter_times: 150
   mse_weight: 1.0
   ce_weight: 1.0
-  gan_ckpt_dir: "experiments/gmi_noise/gan_checkpoints"
-  generator_url: "https://drive.google.com/file/d/1is0tNjxL4QUAqjrhj7x0AjAh4fLIt-D0/view?usp=drive_link"
-  discriminator_url: "https://drive.google.com/file/d/1f9IzPbp8qucx55xN879b-kbDpZtzPpxC/view?usp=drive_link"
 
 steps:
   prepare_datasets: true
+  train_gan: true
   train_models: true
   eval_classification: true
   run_gmi: true

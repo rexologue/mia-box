@@ -4,6 +4,7 @@ import shutil
 import struct
 from collections import OrderedDict
 from dataclasses import dataclass
+from itertools import cycle
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -28,14 +29,24 @@ from ..attack import (
 from ..attack.optimize import SimpleWhiteBoxOptimization, SimpleWhiteBoxOptimizationConfig
 from ..metrics import ImageFidPRDCMetric
 from ..models.classifiers.base import construct_classifiers_by_name
-from ..models.gans import auto_discriminator_from_pretrained, auto_generator_from_pretrained
+from ..models.gans import (
+    GmiDiscriminator64,
+    SimpleGenerator64,
+    auto_discriminator_from_pretrained,
+    auto_generator_from_pretrained,
+)
 from ..sampler import SimpleLatentsSampler
+from ..train import GmiGanTrainConfig, GmiGanTrainer
 
 LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_GAN_GENERATOR_URL = "https://drive.google.com/file/d/1is0tNjxL4QUAqjrhj7x0AjAh4fLIt-D0/view?usp=drive_link"
 DEFAULT_GAN_DISCRIMINATOR_URL = "https://drive.google.com/file/d/1f9IzPbp8qucx55xN879b-kbDpZtzPpxC/view?usp=drive_link"
+
+
+def gan_checkpoint_paths(base_dir: Path) -> tuple[Path, Path]:
+    return base_dir / "G.pth", base_dir / "D.pth"
 
 
 DATASET_CONFIGS = {
@@ -71,9 +82,29 @@ def ensure_gan_checkpoints(
     checkpoint_dir: Path,
     generator_url: str = DEFAULT_GAN_GENERATOR_URL,
     discriminator_url: str = DEFAULT_GAN_DISCRIMINATOR_URL,
+    pretrained_dir: Path | None = None,
+    pretrained_generator: Path | None = None,
+    pretrained_discriminator: Path | None = None,
 ) -> tuple[Path, Path]:
-    generator_path = checkpoint_dir / "G.pth"
-    discriminator_path = checkpoint_dir / "D.pth"
+    generator_path, discriminator_path = gan_checkpoint_paths(checkpoint_dir)
+    if pretrained_dir is not None:
+        pretrained_generator = pretrained_generator or (Path(pretrained_dir) / generator_path.name)
+        pretrained_discriminator = pretrained_discriminator or (Path(pretrained_dir) / discriminator_path.name)
+
+    if pretrained_generator is not None or pretrained_discriminator is not None:
+        if pretrained_generator is None or pretrained_discriminator is None:
+            raise ValueError("Both pretrained_generator and pretrained_discriminator must be provided.")
+        for src, dst in [
+            (Path(pretrained_generator), generator_path),
+            (Path(pretrained_discriminator), discriminator_path),
+        ]:
+            if not src.exists():
+                raise FileNotFoundError(f"Missing pretrained GAN checkpoint: {src}")
+            if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+        return generator_path, discriminator_path
+
     _download_if_missing(generator_url, generator_path)
     _download_if_missing(discriminator_url, discriminator_path)
     return generator_path, discriminator_path
@@ -82,7 +113,7 @@ def ensure_gan_checkpoints(
 def copy_gan_checkpoints_for_attack(
     model_dir: Path, generator_ckpt: Path, discriminator_ckpt: Path
 ) -> tuple[Path, Path]:
-    target_dir = model_dir / "gan"
+    target_dir = model_dir / "gmi"
     target_dir.mkdir(parents=True, exist_ok=True)
     target_generator = target_dir / generator_ckpt.name
     target_discriminator = target_dir / discriminator_ckpt.name
@@ -329,11 +360,21 @@ def ensure_datasets_pt(
 
 
 def load_datasets_from_pt(
-    exp_root: Path, use_public: bool = True, dataset_names: Optional[List[str]] = None
+    exp_root: Path,
+    use_public: bool = True,
+    dataset_names: Optional[List[str]] = None,
+    data_split: str | None = None,
 ) -> List[DatasetDescriptor]:
     exp_root = Path(exp_root)
     datasets: List[DatasetDescriptor] = []
     target_names = dataset_names or ["mnist", "fmnist", "overhead_mnist"]
+    if data_split is not None:
+        split = data_split.lower()
+        if split not in {"public", "private", "all", "full"}:
+            raise ValueError(f"Unsupported data_split={data_split}")
+        use_public = split == "public"
+    else:
+        split = "public" if use_public else "all"
     for name in target_names:
         dataset_dir = exp_root / name / "dataset"
         meta_path = dataset_dir / "meta.json"
@@ -344,7 +385,16 @@ def load_datasets_from_pt(
             data = torch.load(dataset_dir / "train.pt")
             in_channels = data["images"].shape[1]
 
-        if use_public and (dataset_dir / "train_public.pt").exists():
+        if split == "private":
+            train_path = dataset_dir / "train_private.pt"
+            test_path = dataset_dir / "test_private.pt"
+            if not train_path.exists() or not test_path.exists():
+                raise FileNotFoundError(
+                    f"Private split not found for {name}. Run dataset preparation first."
+                )
+            train_data = torch.load(train_path)
+            test_data = torch.load(test_path)
+        elif use_public and (dataset_dir / "train_public.pt").exists():
             train_data = torch.load(dataset_dir / "train_public.pt")
             test_data = torch.load(dataset_dir / "test_public.pt")
         else:
@@ -362,6 +412,160 @@ def load_datasets_from_pt(
         )
         datasets.append(descriptor)
     return datasets
+
+
+# --------------------- GAN helpers ---------------------
+
+
+def resolve_gan_base_dir(exp_root: Path, dataset_name: str, base_dir_template: str | None = None) -> Path:
+    if base_dir_template:
+        return Path(base_dir_template.format(dataset=dataset_name, exp_root=exp_root))
+    return Path(exp_root) / dataset_name / "gan_base"
+
+
+def require_gan_checkpoints(base_dir: Path) -> tuple[Path, Path]:
+    generator_path, discriminator_path = gan_checkpoint_paths(base_dir)
+    if not generator_path.exists() or not discriminator_path.exists():
+        raise FileNotFoundError(
+            f"GAN checkpoints not found in {base_dir}. Train them or provide pretrained weights."
+        )
+    return generator_path, discriminator_path
+
+
+def _build_private_gan_loader(
+    dataset: DatasetDescriptor,
+    preprocess_resolution: int,
+    batch_size: int,
+    num_workers: int,
+):
+    pt_path = dataset.root_dir / "dataset" / "train_private.pt"
+    if not pt_path.exists():
+        raise FileNotFoundError(
+            f"Missing private split for {dataset.name} at {pt_path}. Run dataset preparation first."
+        )
+
+    transform = transforms.ToTensor()
+    gan_dataset = PTImageDataset(
+        pt_path, dataset.name, preprocess_resolution=preprocess_resolution, transform=transform
+    )
+    dataloader = DataLoader(
+        gan_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True,
+    )
+    return cycle(dataloader)
+
+
+def train_gan_for_dataset(
+    dataset: DatasetDescriptor, base_dir: Path, gan_config: Dict[str, object]
+) -> tuple[Path, Path]:
+    train_cfg = gan_config.get("train", {}) if isinstance(gan_config, dict) else {}
+    batch_size = int(train_cfg.get("batch_size", 64))
+    num_workers = int(train_cfg.get("num_workers", 4))
+    preprocess_resolution = int(train_cfg.get("preprocess_resolution", 64))
+    max_iters = int(train_cfg.get("max_iters", 5000))
+    z_dim = int(train_cfg.get("z_dim", 100))
+    lr = float(train_cfg.get("lr", 2e-4))
+    betas = train_cfg.get("betas", (0.5, 0.999))
+    betas = tuple(betas) if isinstance(betas, (list, tuple)) else (0.5, 0.999)
+    save_ckpt_iters = int(train_cfg.get("save_ckpt_iters", 500))
+    show_images_iters = train_cfg.get("show_images_iters", 500)
+    show_train_info_iters = train_cfg.get("show_train_info_iters", 100)
+    ncritic = int(train_cfg.get("ncritic", 5))
+    retrain = bool(train_cfg.get("overwrite", False))
+
+    base_dir = Path(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    generator_path, discriminator_path = gan_checkpoint_paths(base_dir)
+    if generator_path.exists() and discriminator_path.exists() and not retrain:
+        LOGGER.info("GAN for %s already exists at %s; skipping training.", dataset.name, base_dir)
+        return generator_path, discriminator_path
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    LOGGER.info(
+        "Training GAN for %s on private split (iters=%d, batch=%d) on %s",
+        dataset.name,
+        max_iters,
+        batch_size,
+        device,
+    )
+
+    dataloader = _build_private_gan_loader(dataset, preprocess_resolution, batch_size, num_workers)
+    generator = SimpleGenerator64(z_dim).to(device)
+    discriminator = GmiDiscriminator64().to(device)
+
+    gen_optimizer = torch.optim.Adam(generator.parameters(), lr=lr, betas=betas)
+    dis_optimizer = torch.optim.Adam(discriminator.parameters(), lr=lr, betas=betas)
+
+    config = GmiGanTrainConfig(
+        experiment_dir=str(base_dir),
+        batch_size=batch_size,
+        generator=generator,
+        discriminator=discriminator,
+        device=device,
+        gen_optimizer=gen_optimizer,
+        dis_optimizer=dis_optimizer,
+        save_ckpt_iters=save_ckpt_iters,
+        show_images_iters=show_images_iters,
+        show_train_info_iters=show_train_info_iters,
+        ncritic=ncritic,
+        input_size=z_dim,
+    )
+    trainer = GmiGanTrainer(config)
+    config_dump = {
+        "dataset": dataset.name,
+        "train_cfg": train_cfg,
+        "device": str(device),
+    }
+    (base_dir / "gan_train_config.json").write_text(json.dumps(config_dump, indent=2))
+    trainer.train(dataloader, max_iters=max_iters)
+    return gan_checkpoint_paths(base_dir)
+
+
+def prepare_gan_checkpoints_for_datasets(
+    exp_root: Path, dataset_names: List[str], gan_config: Dict[str, object]
+) -> Dict[str, tuple[Path, Path]]:
+    if not gan_config.get("enabled", True):
+        LOGGER.info("GAN stage disabled via configuration.")
+        return {}
+
+    use_pretrained = bool(gan_config.get("use_pretrained", False))
+    base_dir_template = gan_config.get("base_dir_template")
+    pretrained_cfg = gan_config.get("pretrained", {}) if isinstance(gan_config, dict) else {}
+    pretrained_dir = pretrained_cfg.get("directory")
+    pretrained_generator = pretrained_cfg.get("generator_path")
+    pretrained_discriminator = pretrained_cfg.get("discriminator_path")
+    if pretrained_dir is not None:
+        pretrained_dir = Path(pretrained_dir)
+    if pretrained_generator is not None:
+        pretrained_generator = Path(pretrained_generator)
+    if pretrained_discriminator is not None:
+        pretrained_discriminator = Path(pretrained_discriminator)
+
+    datasets = load_datasets_from_pt(
+        exp_root, use_public=False, dataset_names=dataset_names, data_split="private"
+    )
+    checkpoints: Dict[str, tuple[Path, Path]] = {}
+    for dataset in datasets:
+        base_dir = resolve_gan_base_dir(exp_root, dataset.name, base_dir_template)
+        if use_pretrained:
+            LOGGER.info("Loading pretrained GAN for %s", dataset.name)
+            gen_ckpt, dis_ckpt = ensure_gan_checkpoints(
+                base_dir,
+                generator_url=pretrained_cfg.get("generator_url", DEFAULT_GAN_GENERATOR_URL),
+                discriminator_url=pretrained_cfg.get(
+                    "discriminator_url", DEFAULT_GAN_DISCRIMINATOR_URL
+                ),
+                pretrained_dir=pretrained_dir,
+                pretrained_generator=pretrained_generator,
+                pretrained_discriminator=pretrained_discriminator,
+            )
+        else:
+            gen_ckpt, dis_ckpt = train_gan_for_dataset(dataset, base_dir, gan_config)
+        checkpoints[dataset.name] = (gen_ckpt, dis_ckpt)
+    return checkpoints
 
 
 # --------------------- Training helpers ---------------------

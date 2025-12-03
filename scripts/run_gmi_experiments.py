@@ -17,6 +17,8 @@ from modelinversion.experiments.noise_utils import (
     ensure_gan_checkpoints,
     format_sigma,
     load_datasets_from_pt,
+    resolve_gan_base_dir,
+    require_gan_checkpoints,
     run_simple_gmi,
 )
 
@@ -39,24 +41,28 @@ def parse_args():
         nargs="+",
         default=[x / 10 for x in range(0, 11)],
     )
-    parser.add_argument("--generator_template", type=str, default=None, help="Format string for generator checkpoint (use {dataset}).")
-    parser.add_argument(
-        "--discriminator_template",
-        type=str,
-        default=None,
-        help="Format string for discriminator checkpoint (use {dataset}).",
-    )
-    parser.add_argument(
-        "--gan_root",
-        type=Path,
-        default=None,
-        help="Root directory containing <dataset>_gan/G.pth and D.pth when templates are not provided.",
-    )
     parser.add_argument(
         "--gan_ckpt_dir",
         type=Path,
         default=None,
-        help="Directory to store shared GAN checkpoints downloaded from Google Drive.",
+        help="Optional root for GAN checkpoints (defaults to <exp_root>/<dataset>/gan_base).",
+    )
+    parser.add_argument(
+        "--gan_base_dir_template",
+        type=str,
+        default=None,
+        help="Format string for GAN base directories using {dataset} and {exp_root}.",
+    )
+    parser.add_argument(
+        "--gan_use_pretrained",
+        action="store_true",
+        help="Download or copy pretrained GANs instead of assuming they were trained in-pipeline.",
+    )
+    parser.add_argument(
+        "--gan_pretrained_dir",
+        type=Path,
+        default=None,
+        help="Directory containing pretrained GAN checkpoints to copy into the base directory.",
     )
     parser.add_argument(
         "--generator_url",
@@ -85,14 +91,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def _resolve_gan_path(dataset_name: str, template: str | None, gan_root: Path | None, filename: str) -> Path | None:
-    if template:
-        return Path(template.format(dataset=dataset_name))
-    if gan_root:
-        return gan_root / f"{dataset_name}_gan" / filename
-    return None
-
-
 def plot_metric_curve(dataset_name: str, metric_name: str, records: dict, root: Path):
     xs = sorted(records.keys())
     ys = [records[x][metric_name] for x in xs]
@@ -108,19 +106,15 @@ def plot_metric_curve(dataset_name: str, metric_name: str, records: dict, root: 
 
 def main():
     args = parse_args()
-    gan_ckpt_dir = args.gan_ckpt_dir or (args.exp_root / "gan_checkpoints")
-    base_generator_ckpt, base_discriminator_ckpt = ensure_gan_checkpoints(
-        gan_ckpt_dir,
-        generator_url=args.generator_url,
-        discriminator_url=args.discriminator_url,
-    )
+    base_dir_template = args.gan_base_dir_template
 
-    def _choose_path(candidate: Path | None, fallback: Path) -> Path:
-        if candidate and candidate.exists():
-            return candidate
-        if candidate:
-            LOGGER.warning("Checkpoint %s not found; falling back to shared GAN checkpoint", candidate)
-        return fallback
+    def _resolve_base_dir(dataset_name: str) -> Path:
+        if base_dir_template:
+            return Path(base_dir_template.format(dataset=dataset_name, exp_root=args.exp_root))
+        if args.gan_ckpt_dir:
+            return Path(args.gan_ckpt_dir) / dataset_name / "gan_base"
+        return resolve_gan_base_dir(args.exp_root, dataset_name)
+
     datasets = load_datasets_from_pt(
         args.exp_root, use_public=args.use_public_only, dataset_names=args.datasets
     )
@@ -128,6 +122,17 @@ def main():
 
     for dataset in datasets:
         LOGGER.info("Running GMI for dataset %s", dataset.name)
+        base_dir = _resolve_base_dir(dataset.name)
+        if args.gan_use_pretrained:
+            base_generator_ckpt, base_discriminator_ckpt = ensure_gan_checkpoints(
+                base_dir,
+                generator_url=args.generator_url,
+                discriminator_url=args.discriminator_url,
+                pretrained_dir=args.gan_pretrained_dir,
+            )
+        else:
+            base_generator_ckpt, base_discriminator_ckpt = require_gan_checkpoints(base_dir)
+
         dataset_records = {}
         for sigma in args.noise_levels:
             sigma_str = format_sigma(sigma)
@@ -135,16 +140,8 @@ def main():
             if not model_path.exists():
                 LOGGER.warning("Missing checkpoint for sigma %s", sigma_str)
                 continue
-            generator_ckpt = _resolve_gan_path(
-                dataset.name, args.generator_template, args.gan_root, "G.pth"
-            )
-            discriminator_ckpt = _resolve_gan_path(
-                dataset.name, args.discriminator_template, args.gan_root, "D.pth"
-            )
-            generator_ckpt = _choose_path(generator_ckpt, base_generator_ckpt)
-            discriminator_ckpt = _choose_path(discriminator_ckpt, base_discriminator_ckpt)
             generator_ckpt, discriminator_ckpt = copy_gan_checkpoints_for_attack(
-                model_path.parent, generator_ckpt, discriminator_ckpt
+                model_path.parent, base_generator_ckpt, base_discriminator_ckpt
             )
             metrics = run_simple_gmi(
                 dataset,
