@@ -1014,10 +1014,13 @@ def _run_gmi_with_pretrained_gan(
     inner_iter_times: int,
     class_loss_weight: float,
     disc_loss_weight: float,
-    generator_ckpt_path: Path,
-    discriminator_ckpt_path: Path,
     save_image_iters: Optional[list[int]] = None,
+    generator_ckpt_path: Path | None = None,
+    discriminator_ckpt_path: Path | None = None,
 ):
+    if generator_ckpt_path is None or discriminator_ckpt_path is None:
+        raise ValueError("Generator and discriminator checkpoints must be provided for pretrained GMI.")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = int(dataset.train_labels.max().item()) + 1
 
