@@ -81,6 +81,13 @@ def parse_args():
     parser.add_argument("--inner_iter_times", type=int, default=1500)
     parser.add_argument("--class_loss_weight", type=float, default=100.0)
     parser.add_argument("--disc_loss_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--save_image_iters",
+        type=int,
+        nargs="+",
+        default=[50, 100, 150, 200],
+        help="Iterations within each optimization run at which to save reconstruction grids.",
+    )
     parser.add_argument("--use_public_only", action="store_true")
     parser.add_argument(
         "--datasets",
@@ -153,6 +160,9 @@ def main():
                 mse_weight=args.mse_weight,
                 ce_weight=args.ce_weight,
                 iter_times=args.iter_times,
+                save_image_iters=[
+                    i for i in args.save_image_iters if 0 < i <= args.inner_iter_times
+                ],
                 generator_ckpt_path=generator_ckpt,
                 discriminator_ckpt_path=discriminator_ckpt,
                 preprocess_resolution=args.preprocess_resolution,
@@ -164,7 +174,11 @@ def main():
             )
             dataset_records[sigma] = metrics
         if dataset_records:
-            for metric_name in ["mse_mean", "psnr_mean", "ssim_mean"]:
+            available_metrics = set().union(*(m.keys() for m in dataset_records.values()))
+            metric_names = ["mse_mean", "psnr_mean", "ssim_mean"]
+            if "fid" in available_metrics:
+                metric_names.append("fid")
+            for metric_name in metric_names:
                 plot_metric_curve(dataset.name, metric_name, dataset_records, dataset.root_dir)
             summary[dataset.name] = dataset_records
 
