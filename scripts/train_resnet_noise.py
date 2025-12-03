@@ -60,18 +60,18 @@ def summarize_dataset_metrics(dataset_name: str, exp_root: Path, noise_levels: L
             continue
         data = json.loads(metrics_path.read_text())
         xs.append(sigma)
-        accs.append(data.get("test_acc", 0))
-        losses.append(data.get("min_train_loss", 0))
+        accs.append(data.get("val_acc_best_epoch") or data.get("test_acc", 0))
+        losses.append(data.get("val_loss_best_epoch") or data.get("train_loss_min", 0))
     if not xs:
         return
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
     ax[0].plot(xs, accs, marker="o")
     ax[0].set_xlabel("sigma")
-    ax[0].set_ylabel("test acc")
+    ax[0].set_ylabel("best acc")
     ax[0].set_title("Accuracy vs noise")
     ax[1].plot(xs, losses, marker="o", color="orange")
     ax[1].set_xlabel("sigma")
-    ax[1].set_ylabel("min train loss")
+    ax[1].set_ylabel("best loss")
     ax[1].set_title("Loss vs noise")
     plt.tight_layout()
     fig.savefig(exp_root / dataset_name / "summary_sigma_curves.png", bbox_inches="tight")
