@@ -16,6 +16,7 @@ from modelinversion.experiments.noise_utils import (
     DEFAULT_GAN_GENERATOR_URL,
     ensure_datasets_pt,
     load_datasets_from_pt,
+    prepare_gan_checkpoints_for_datasets,
 )
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
@@ -24,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_STEPS = {
     "prepare_datasets": True,
+    "train_gan": True,
     "train_models": True,
     "eval_classification": True,
     "run_gmi": True,
@@ -53,6 +55,7 @@ def main():
     exp_root = Path(cfg.get("exp_root", "experiments/gmi_noise"))
     dataset_names = cfg.get("datasets", ["mnist", "fmnist", "overhead_mnist"])
     steps = DEFAULT_STEPS | cfg.get("steps", {})
+    gan_cfg = cfg.get("gan", {})
 
     # set seeds
     seed = cfg.get("training", {}).get("seed", 42)
@@ -66,6 +69,9 @@ def main():
 
     if steps.get("prepare_datasets", True):
         run_prepare(exp_root, dataset_names)
+
+    if steps.get("train_gan", True) and gan_cfg.get("enabled", True):
+        prepare_gan_checkpoints_for_datasets(exp_root, dataset_names, gan_cfg)
 
     if steps.get("train_models", True):
         # Build args for training script
@@ -105,7 +111,9 @@ def main():
 
     if steps.get("run_gmi", False) and cfg.get("gmi", {}).get("enabled", True):
         gmi_cfg = cfg.get("gmi", {})
-        gan_ckpt_dir = Path(gmi_cfg.get("gan_ckpt_dir", exp_root / "gan_checkpoints"))
+        gan_root = gan_cfg.get("gan_ckpt_dir") or gan_cfg.get("base_dir_root")
+        gan_base_template = gan_cfg.get("base_dir_template")
+        gan_pretrained_cfg = gan_cfg.get("pretrained", {}) if isinstance(gan_cfg, dict) else {}
         gmi_args = [
             "--exp_root", str(exp_root),
             "--batch_size", str(gmi_cfg.get("batch_size", 16)),
@@ -114,11 +122,26 @@ def main():
             "--iter_times", str(gmi_cfg.get("iter_times", 200)),
             "--mse_weight", str(gmi_cfg.get("mse_weight", 1.0)),
             "--ce_weight", str(gmi_cfg.get("ce_weight", 1.0)),
-            "--gan_ckpt_dir", str(gan_ckpt_dir),
-            "--generator_url", gmi_cfg.get("generator_url", DEFAULT_GAN_GENERATOR_URL),
-            "--discriminator_url", gmi_cfg.get("discriminator_url", DEFAULT_GAN_DISCRIMINATOR_URL),
             "--datasets", *dataset_names,
         ]
+        if gan_root:
+            gmi_args.extend(["--gan_ckpt_dir", str(gan_root)])
+        if gan_base_template:
+            gmi_args.extend(["--gan_base_dir_template", gan_base_template])
+        if gan_cfg.get("use_pretrained", False):
+            gmi_args.append("--gan_use_pretrained")
+        if gan_pretrained_cfg.get("directory"):
+            gmi_args.extend(["--gan_pretrained_dir", str(gan_pretrained_cfg["directory"])])
+        gmi_args.extend(
+            [
+                "--generator_url",
+                gan_pretrained_cfg.get("generator_url", DEFAULT_GAN_GENERATOR_URL),
+                "--discriminator_url",
+                gan_pretrained_cfg.get(
+                    "discriminator_url", DEFAULT_GAN_DISCRIMINATOR_URL
+                ),
+            ]
+        )
         if cfg.get("use_public_only", True):
             gmi_args.append("--use_public_only")
         noise_levels = cfg.get("noise_levels")
