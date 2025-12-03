@@ -34,6 +34,10 @@ from ..sampler import SimpleLatentsSampler
 LOGGER = logging.getLogger(__name__)
 
 
+DEFAULT_GAN_GENERATOR_URL = "https://drive.google.com/file/d/1is0tNjxL4QUAqjrhj7x0AjAh4fLIt-D0/view?usp=drive_link"
+DEFAULT_GAN_DISCRIMINATOR_URL = "https://drive.google.com/file/d/1f9IzPbp8qucx55xN879b-kbDpZtzPpxC/view?usp=drive_link"
+
+
 DATASET_CONFIGS = {
     "mnist": {
         "factory": torchvision.datasets.MNIST,
@@ -51,6 +55,42 @@ DATASET_CONFIGS = {
         "in_channels": 1,
     },
 }
+
+
+def _download_if_missing(url: str, path: Path):
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Downloading %s to %s via gdown", path.name, path)
+    downloaded_path = gdown.download(url=url, output=str(path), quiet=False, fuzzy=True)
+    if downloaded_path is None or not Path(downloaded_path).exists():
+        raise RuntimeError(f"Failed to download {url} to {path}")
+
+
+def ensure_gan_checkpoints(
+    checkpoint_dir: Path,
+    generator_url: str = DEFAULT_GAN_GENERATOR_URL,
+    discriminator_url: str = DEFAULT_GAN_DISCRIMINATOR_URL,
+) -> tuple[Path, Path]:
+    generator_path = checkpoint_dir / "G.pth"
+    discriminator_path = checkpoint_dir / "D.pth"
+    _download_if_missing(generator_url, generator_path)
+    _download_if_missing(discriminator_url, discriminator_path)
+    return generator_path, discriminator_path
+
+
+def copy_gan_checkpoints_for_attack(
+    model_dir: Path, generator_ckpt: Path, discriminator_ckpt: Path
+) -> tuple[Path, Path]:
+    target_dir = model_dir / "gan"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_generator = target_dir / generator_ckpt.name
+    target_discriminator = target_dir / discriminator_ckpt.name
+    if not target_generator.exists():
+        shutil.copyfile(generator_ckpt, target_generator)
+    if not target_discriminator.exists():
+        shutil.copyfile(discriminator_ckpt, target_discriminator)
+    return target_generator, target_discriminator
 
 
 class PTImageDataset(torch.utils.data.Dataset):
@@ -841,3 +881,4 @@ def construct_generator():
     return generator
 
 
+import gdown

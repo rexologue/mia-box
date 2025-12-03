@@ -5,6 +5,7 @@ facenet_pytorch==2.5.2
 ignite==1.1.0
 kagglehub==0.3.13
 kornia==0.7.2
+gdown==5.2.0
 lmdb==1.4.1
 matplotlib==3.8.2
 ml_collections==0.1.1
